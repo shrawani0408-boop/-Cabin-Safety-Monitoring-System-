@@ -1,0 +1,446 @@
+
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include <Servo.h>
+#include <math.h>
+
+#define DHT_PIN 2
+#define SERVO_PIN 0
+
+#define TRIG_PIN 10
+#define ECHO_PIN 13
+
+#define MQ7_PIN A0
+#define MQ6_PIN A1
+
+#define GREEN_LED A2
+#define YELLOW_LED A3
+#define RED_LED 11
+#define BUZZER_PIN 12
+
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+Servo safetyServo;
+
+const int BRAKE_RELEASED = 0;
+const int BRAKE_APPLIED = 90;
+
+const int MQ6_BASELINE = 200;
+const int MQ7_BASELINE = 200;
+const int GAS_WARNING_RISE = 25;
+const int GAS_HAZARD_RISE = 60;
+
+const float WARM_TEMP = 35.0;
+const float HOT_TEMP = 45.0;
+
+const float PRESENCE_CM = 30.0;
+const float OBSTACLE_WARNING_CM = 20.0;
+const float OBSTACLE_CRITICAL_CM = 10.0;
+
+const float TILT_WARNING_DEG = 15.0;
+const float ROLLOVER_DEG = 60.0;
+const float IMPACT_G = 2.5;
+const float GYRO_IMPACT_DPS = 100.0;
+
+const byte MPU_ADDR = 0x68;
+
+int16_t axRaw, ayRaw, azRaw;
+int16_t gxRaw, gyRaw, gzRaw;
+
+float ax = 0, ay = 0, az = 1;
+float gx = 0, gy = 0, gz = 0;
+
+float gyroXOffset = 0;
+float gyroYOffset = 0;
+float gyroZOffset = 0;
+
+float rollAngle = 0;
+float pitchAngle = 0;
+
+bool mpuAvailable = false;
+bool hazardLatched = false;
+bool brakeApplied = true;
+
+float temperatureC = NAN;
+float humidityPct = NAN;
+float distanceCM = -1;
+
+int mq6Value = 0;
+int mq7Value = 0;
+
+String finalStatus = "Starting";
+unsigned long lastUpdate = 0;
+
+void applyBrake() {
+  safetyServo.write(BRAKE_APPLIED);
+  brakeApplied = true;
+}
+
+void releaseBrake() {
+  safetyServo.write(BRAKE_RELEASED);
+  brakeApplied = false;
+}
+
+bool readDHT11(float &temp, float &hum) {
+  byte data[5] = {0, 0, 0, 0, 0};
+
+  pinMode(DHT_PIN, OUTPUT);
+  digitalWrite(DHT_PIN, LOW);
+  delay(20);
+
+  digitalWrite(DHT_PIN, HIGH);
+  delayMicroseconds(30);
+  pinMode(DHT_PIN, INPUT_PULLUP);
+
+  unsigned long timeout = micros();
+
+  while (digitalRead(DHT_PIN) == HIGH) {
+    if (micros() - timeout > 100) return false;
+  }
+
+  timeout = micros();
+  while (digitalRead(DHT_PIN) == LOW) {
+    if (micros() - timeout > 100) return false;
+  }
+
+  timeout = micros();
+  while (digitalRead(DHT_PIN) == HIGH) {
+    if (micros() - timeout > 100) return false;
+  }
+
+  for (byte i = 0; i < 40; i++) {
+    timeout = micros();
+
+    while (digitalRead(DHT_PIN) == LOW) {
+      if (micros() - timeout > 100) return false;
+    }
+
+    unsigned long pulseStart = micros();
+    timeout = micros();
+
+    while (digitalRead(DHT_PIN) == HIGH) {
+      if (micros() - timeout > 100) return false;
+    }
+
+    data[i / 8] <<= 1;
+
+    if (micros() - pulseStart > 40) {
+      data[i / 8] |= 1;
+    }
+  }
+
+  byte checksum = data[0] + data[1] + data[2] + data[3];
+
+  if (checksum != data[4]) return false;
+
+  hum = data[0] + data[1] * 0.1;
+  temp = data[2] + data[3] * 0.1;
+
+  return true;
+}
+
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000UL);
+
+  if (duration == 0) return -1;
+
+  return duration * 0.0343 / 2.0;
+}
+
+bool readMPURegisters() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) return false;
+
+  if (Wire.requestFrom(MPU_ADDR, (byte)14) != 14) {
+    return false;
+  }
+
+  axRaw = (Wire.read() << 8) | Wire.read();
+  ayRaw = (Wire.read() << 8) | Wire.read();
+  azRaw = (Wire.read() << 8) | Wire.read();
+
+  Wire.read();
+  Wire.read();
+
+  gxRaw = (Wire.read() << 8) | Wire.read();
+  gyRaw = (Wire.read() << 8) | Wire.read();
+  gzRaw = (Wire.read() << 8) | Wire.read();
+
+  ax = axRaw / 16384.0;
+  ay = ayRaw / 16384.0;
+  az = azRaw / 16384.0;
+
+  gx = gxRaw / 131.0 - gyroXOffset;
+  gy = gyRaw / 131.0 - gyroYOffset;
+  gz = gzRaw / 131.0 - gyroZOffset;
+
+  rollAngle = atan2(ay, az) * 180.0 / PI;
+  pitchAngle = atan2(-ax, sqrt(ay * ay + az * az))
+               * 180.0 / PI;
+
+  return true;
+}
+
+void calibrateGyro() {
+  long sumX = 0;
+  long sumY = 0;
+  long sumZ = 0;
+  int validSamples = 0;
+
+  lcd.clear();
+  lcd.print("Calibrating MPU");
+  lcd.setCursor(0, 1);
+  lcd.print("Keep it still");
+
+  for (int i = 0; i < 300; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43);
+
+    if (Wire.endTransmission(false) == 0 &&
+        Wire.requestFrom(MPU_ADDR, (byte)6) == 6) {
+
+      int16_t x = (Wire.read() << 8) | Wire.read();
+      int16_t y = (Wire.read() << 8) | Wire.read();
+      int16_t z = (Wire.read() << 8) | Wire.read();
+
+      sumX += x;
+      sumY += y;
+      sumZ += z;
+      validSamples++;
+    }
+
+    delay(5);
+  }
+
+  if (validSamples > 0) {
+    gyroXOffset = sumX / (float)validSamples / 131.0;
+    gyroYOffset = sumY / (float)validSamples / 131.0;
+    gyroZOffset = sumZ / (float)validSamples / 131.0;
+  }
+
+  delay(800);
+}
+
+void readGasSensors() {
+  mq6Value = analogRead(MQ6_PIN);
+  mq7Value = analogRead(MQ7_PIN);
+}
+
+bool gasWarning() {
+  return (mq6Value - MQ6_BASELINE >= GAS_WARNING_RISE) ||
+         (mq7Value - MQ7_BASELINE >= GAS_WARNING_RISE);
+}
+
+bool gasHazard() {
+  return (mq6Value - MQ6_BASELINE >= GAS_HAZARD_RISE) ||
+         (mq7Value - MQ7_BASELINE >= GAS_HAZARD_RISE);
+}
+
+void setLEDs(bool green, bool yellow, bool red) {
+  digitalWrite(GREEN_LED, green);
+  digitalWrite(YELLOW_LED, yellow);
+  digitalWrite(RED_LED, red);
+  digitalWrite(BUZZER_PIN, red ? HIGH : LOW);
+}
+
+void showStatus(const String &status) {
+  static String previousStatus = "";
+
+  if (status == previousStatus) return;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(status);
+
+  lcd.setCursor(0, 1);
+  lcd.print(brakeApplied ? "Brake: APPLIED" : "Brake: RELEASED");
+
+  previousStatus = status;
+}
+
+void evaluateSystem() {
+  bool temperatureValid = !isnan(temperatureC);
+
+  bool warmCabin = temperatureValid &&
+                   temperatureC >= WARM_TEMP &&
+                   temperatureC <= HOT_TEMP;
+
+  bool hotCabin = temperatureValid && temperatureC > HOT_TEMP;
+
+  bool presenceDetected = distanceCM > 0 &&
+                          distanceCM < PRESENCE_CM;
+
+  bool obstacleCritical = distanceCM > 0 &&
+                          distanceCM < OBSTACLE_CRITICAL_CM;
+
+  bool obstacleWarning = distanceCM > 0 &&
+                         distanceCM < OBSTACLE_WARNING_CM;
+
+  bool gasWarn = gasWarning();
+  bool gasDanger = gasHazard();
+
+  float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
+
+  bool impactDetected =
+      fabs(gx) >= GYRO_IMPACT_DPS ||
+      fabs(gy) >= GYRO_IMPACT_DPS ||
+      fabs(gz) >= GYRO_IMPACT_DPS ||
+      accelMagnitude >= IMPACT_G;
+
+  bool rolloverDetected =
+      fabs(rollAngle) >= ROLLOVER_DEG ||
+      fabs(pitchAngle) >= ROLLOVER_DEG;
+
+  bool roughRoad =
+      fabs(rollAngle) >= TILT_WARNING_DEG ||
+      fabs(pitchAngle) >= TILT_WARNING_DEG;
+
+  bool rolloverRisk = rolloverDetected &&
+                      gasDanger &&
+                      obstacleWarning;
+
+  bool fireRisk = hotCabin && gasWarn;
+
+  if (impactDetected || fireRisk || rolloverRisk) {
+    hazardLatched = true;
+  }
+
+  bool shouldBrake = obstacleWarning ||
+                     hazardLatched ||
+                     !mpuAvailable;
+
+  if (shouldBrake) {
+    applyBrake();
+  } else {
+    releaseBrake();
+  }
+
+  if (rolloverRisk) {
+    finalStatus = "Rollover + Gas";
+    setLEDs(false, false, true);
+  }
+  else if (fireRisk) {
+    finalStatus = "Fire Risk";
+    setLEDs(false, false, true);
+  }
+  else if (hazardLatched) {
+    finalStatus = "Collision Detected";
+    setLEDs(false, false, true);
+  }
+  else if (obstacleCritical) {
+    finalStatus = "Obstacle Critical";
+    setLEDs(false, false, true);
+  }
+  else if (obstacleWarning) {
+    finalStatus = "Obstacle Ahead";
+    setLEDs(false, true, false);
+  }
+  else if (hotCabin && presenceDetected) {
+    finalStatus = "Heat Hazard";
+    setLEDs(false, false, true);
+  }
+  else if (gasDanger) {
+    finalStatus = "Gas Hazard";
+    setLEDs(false, false, true);
+  }
+  else if (gasWarn) {
+    finalStatus = "Leak Suspected";
+    setLEDs(false, true, false);
+  }
+  else if (roughRoad) {
+    finalStatus = "Rough Road";
+    setLEDs(false, true, false);
+  }
+  else if (warmCabin) {
+    finalStatus = "Cabin Warm";
+    setLEDs(false, true, false);
+  }
+  else {
+    finalStatus = "System Stable";
+    setLEDs(true, false, false);
+  }
+}
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(MQ6_PIN, INPUT);
+  pinMode(MQ7_PIN, INPUT);
+
+  lcd.begin(16, 2);
+
+  safetyServo.attach(SERVO_PIN);
+  applyBrake();
+
+  setLEDs(false, false, false);
+
+  lcd.print("Safety Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  delay(1500);
+
+  Wire.begin();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  mpuAvailable = (Wire.endTransmission() == 0);
+
+  if (mpuAvailable) {
+    delay(100);
+    calibrateGyro();
+  } else {
+    lcd.clear();
+    lcd.print("MPU ERROR");
+    lcd.setCursor(0, 1);
+    lcd.print("Brake applied");
+    applyBrake();
+    delay(1500);
+  }
+
+  applyBrake();
+
+  lcd.clear();
+  lcd.print("Safety Ready");
+  delay(1000);
+}
+
+void loop() {
+  if (millis() - lastUpdate < 1500) {
+    return;
+  }
+
+  lastUpdate = millis();
+
+  float newTemp;
+  float newHumidity;
+
+  if (readDHT11(newTemp, newHumidity)) {
+    temperatureC = newTemp;
+    humidityPct = newHumidity;
+  }
+
+  readGasSensors();
+  distanceCM = readDistanceCM();
+
+  if (mpuAvailable && !readMPURegisters()) {
+    mpuAvailable = false;
+  }
+
+  evaluateSystem();
+  showStatus(finalStatus);
+}
